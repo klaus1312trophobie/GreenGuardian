@@ -1,0 +1,4 @@
+.pio/
+.vscode/
+# contains WiFi password and Telegram token – copy config.example.h instead
+include/config.h
