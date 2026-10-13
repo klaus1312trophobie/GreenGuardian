@@ -204,9 +204,30 @@ void saveMinMax() {
 // ----------------------------------------------------------------------------
 bool tgEnabled() { return strlen(TELEGRAM_BOT_TOKEN) > 10 && strlen(TELEGRAM_CHAT_ID) > 0; }
 
+// Single-shot send: bot.sendMessage() re-POSTs for up to 8 s when the reply is slow
+// (weak WiFi), which delivered the same message 2-3 times.
+bool tgSendTo(const String &chatId, const String &msg, const char *parseMode = "HTML") {
+  JsonDocument doc;
+  JsonObject payload = doc.to<JsonObject>();
+  payload["chat_id"] = chatId;
+  payload["text"] = msg;
+  if (strlen(parseMode)) payload["parse_mode"] = parseMode;
+  String response = bot.sendPostToTelegram(bot.buildCommand("sendMessage"), payload);
+  tgClient.stop();
+  return bot.checkForOkResponse(response);
+}
+
+// Returns the real result (Telegram confirmed delivery); used by the dashboard test button.
+bool tgSendChecked(const String &msg) {
+  if (!tgEnabled() || WiFi.status() != WL_CONNECTED) return false;
+  return tgSendTo(TELEGRAM_CHAT_ID, msg);
+}
+
+// Fire-and-forget for alerts/reports: never retry, a lost reply usually still means delivered.
 bool tgSend(const String &msg) {
   if (!tgEnabled() || WiFi.status() != WL_CONNECTED) return false;
-  return bot.sendMessage(TELEGRAM_CHAT_ID, msg, "HTML");
+  tgSendTo(TELEGRAM_CHAT_ID, msg);
+  return true;
 }
 
 String statusReport(const char *title) {
@@ -241,7 +262,7 @@ void pollTelegram() {
     for (int i = 0; i < n; i++) {
       telegramMessage &m = bot.messages[i];
       if (m.chat_id != TELEGRAM_CHAT_ID) {
-        bot.sendMessage(m.chat_id, "🚫 This is a private grow. Your chat ID is: " + m.chat_id, "");
+        tgSendTo(m.chat_id, "🚫 This is a private grow. Your chat ID is: " + m.chat_id, "");
         continue;
       }
       String cmd = m.text;
@@ -607,7 +628,7 @@ void handleWatered() {
 
 void handleTelegramTest() {
   if (!tgEnabled()) return sendResult(false, "Telegram is not configured (see config.h)");
-  bool ok = tgSend(statusReport("Test from the dashboard"));
+  bool ok = tgSendChecked(statusReport("Test from the dashboard"));
   sendResult(ok, ok ? "Message sent" : "Sending failed");
 }
 
