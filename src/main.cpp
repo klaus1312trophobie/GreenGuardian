@@ -84,6 +84,8 @@ int lastReportKey = 0;                  // year*1000 + yday of last daily report
 // ----------------------------------------------------------------------------
 //  24 h history: one point every 5 minutes
 // ----------------------------------------------------------------------------
+constexpr uint32_t HEAP_MIN_FREE = 25000;   // restart below this many free bytes
+constexpr uint32_t HEAP_MIN_BLOCK = 12000;  // ...or if the largest free block shrinks below this
 constexpr int HIST_N = 288;
 constexpr uint32_t HIST_INTERVAL_MS = 5UL * 60UL * 1000UL;
 constexpr int16_t NO_VAL = INT16_MIN;
@@ -547,6 +549,9 @@ void handleData() {
   d["lastWatered"] = (uint32_t)lastWatered;
   d["now"] = timeValid() ? (uint32_t)time(nullptr) : 0;
   d["uptime"] = millis() / 1000;
+  d["freeHeap"] = ESP.getFreeHeap();
+  d["minHeap"] = ESP.getMinFreeHeap();
+  d["maxAlloc"] = ESP.getMaxAllocHeap();
   d["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
   d["ip"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
   d["telegram"] = tgEnabled();
@@ -721,9 +726,19 @@ void setup() {
   setupWeb();
 }
 
+// Heap fragmentation guard: restart if memory gets critically low (settings live in NVS, so nothing is lost)
+void checkHeap() {
+  if (ESP.getFreeHeap() < HEAP_MIN_FREE || ESP.getMaxAllocHeap() < HEAP_MIN_BLOCK) {
+    Serial.printf("Low heap (free %u, block %u) - restarting\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    saveMinMax();
+    delay(200);
+    ESP.restart();
+  }
+}
+
 void loop() {
   static uint32_t tSample = 0, tPage = 0, tRedraw = 0, tHist = 0, tWater = 0,
-                  tAlert = 0, tTg = 0, tPersist = 0, tDaily = 0;
+                  tAlert = 0, tTg = 0, tPersist = 0, tDaily = 0, tHeap = 0;
   static bool histSeeded = false;
   uint32_t now = millis();
 
@@ -750,5 +765,6 @@ void loop() {
   if (now - tAlert >= 10000) { tAlert = now; maintainWifi(); checkAlerts(); }
   if (now - tDaily >= 30000) { tDaily = now; checkDailyReport(); }
   if (now - tTg >= 8000) { tTg = now; pollTelegram(); }
+  if (now - tHeap >= 60000) { tHeap = now; checkHeap(); }
   if (now - tPersist >= 15UL * 60UL * 1000UL) { tPersist = now; saveMinMax(); }
 }

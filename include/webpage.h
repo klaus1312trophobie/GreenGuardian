@@ -118,6 +118,7 @@ footer{text-align:center;color:var(--mut);font-size:.8rem;margin:22px 0 6px}
   <div class="kv"><span>WiFi signal</span><span id="rssi">--</span></div>
   <div class="kv"><span>IP</span><span id="ip">--</span></div>
   <div class="kv"><span>Uptime</span><span id="up">--</span></div>
+  <div class="kv"><span>Free heap (min / largest block)</span><span id="heap">--</span></div>
   <div class="kv"><span>DHT22 read errors</span><span id="derr">--</span></div>
  </div>
 </div>
@@ -169,7 +170,7 @@ function render(){
  if(document.activeElement!==$('rep'))$('rep').value=d.reportHour;
  $('tg').textContent=d.telegram?'✅ connected':'⚠️ not configured';
  $('dew').textContent=f(d.dewPoint)+' °C';$('hix').textContent=f(d.heatIndex)+' °C';$('vstage').textContent=d.vpdStage;
- $('rssi').textContent=d.rssi?d.rssi+' dBm':'--';$('ip').textContent=d.ip;$('up').textContent=upt(d.uptime);$('derr').textContent=d.dhtErrors;
+ $('rssi').textContent=d.rssi?d.rssi+' dBm':'--';$('ip').textContent=d.ip;$('up').textContent=upt(d.uptime);$('heap').textContent=Math.round(d.freeHeap/1024)+' kB ('+Math.round(d.minHeap/1024)+' / '+Math.round(d.maxAlloc/1024)+')';$('derr').textContent=d.dhtErrors;
  $('clock').textContent=d.now?new Date(d.now*1000).toLocaleTimeString():'no time sync';
  const b=$('banner');
  if(d.warmingUp){b.className='banner';b.textContent='⏳ Warming up sensors (10 s average)...';}
