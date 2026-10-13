@@ -26,7 +26,7 @@ h1{margin:0;font-size:1.7rem;letter-spacing:.5px;background:linear-gradient(90de
 @keyframes pulse{50%{box-shadow:0 0 18px #ff6b5b55}}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;backdrop-filter:blur(6px)}
-.card h2{margin:0 0 10px;font-size:.8rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--mut);font-weight:600}
+.card h2{margin:0 0 10px;font-size:.8rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--mut);font-weight:600;text-align:center}
 .gauge{display:flex;align-items:center;gap:14px}
 .gauge svg{width:110px;height:110px;flex:none}
 .gauge .val{font-size:2rem;font-weight:700}
@@ -39,7 +39,8 @@ td,th{padding:7px 4px;border-bottom:1px solid var(--line);text-align:right}
 td:first-child,th:first-child{text-align:left}
 th{color:var(--mut);font-weight:500;font-size:.8rem}
 .lo{color:var(--blue)}.hi{color:var(--gold)}
-button{background:linear-gradient(135deg,#2f7d38,#4caf50);color:#fff;border:0;border-radius:12px;padding:10px 14px;font-weight:600;cursor:pointer;margin:4px 4px 0 0;font-size:.9rem}
+button{background:linear-gradient(135deg,#2f7d38,#4caf50);color:#fff;border:0;border-radius:12px;padding:10px 14px;font-weight:600;cursor:pointer;margin:4px 3px 0;font-size:.9rem}
+.btns{text-align:center}
 button:hover{filter:brightness(1.15)}
 button.alt{background:#24402a}button.warn{background:linear-gradient(135deg,#8a5a12,#c98a1c)}
 .big{width:100%;padding:14px;font-size:1.05rem;margin:6px 0}
@@ -88,7 +89,7 @@ footer{text-align:center;color:var(--mut);font-size:.8rem;margin:22px 0 6px}
    <tr><td>Humidity</td><td class="lo" id="hMin">--</td><td id="hNow">--</td><td class="hi" id="hMax">--</td></tr>
   </table>
   <div class="sub" style="margin-top:8px">Since: <span id="mmSince">--</span></div>
-  <button class="alt" onclick="post('/api/reset-minmax','Reset all min/max values?')">↺ Reset Min/Max</button>
+  <div class="btns"><button class="alt" onclick="post('/api/reset-minmax','Reset all min/max values?')">↺ Reset Min/Max</button></div>
  </div>
 
  <div class="card">
@@ -97,16 +98,20 @@ footer{text-align:center;color:var(--mut);font-size:.8rem;margin:22px 0 6px}
   <div class="kv"><span>Raw sensor value</span><span id="raw">--</span></div>
   <div class="kv"><span>Dry (0%) / Wet (100%)</span><span><span id="dry">--</span> / <span id="wet">--</span></span></div>
   <div class="kv"><span>Last watered</span><span id="lastW">--</span></div>
+  <div class="btns">
   <button class="alt" onclick="post('/api/watered')">📝 Log watering</button>
   <button class="warn" onclick="post('/api/calibrate?type=dry','Is the sensor in completely DRY soil (or in the air)? The current reading will become 0%.')">🏜️ Set dry (0%)</button>
+  </div>
  </div>
 
  <div class="card">
   <h2>⚙️ Settings &amp; Telegram</h2>
   <label>Water alert below (%)<input type="number" id="thr" min="5" max="95"></label>
   <label>Daily report hour (-1 = off)<input type="number" id="rep" min="-1" max="23"></label>
+  <div class="btns">
   <button onclick="saveSettings()">💾 Save</button>
   <button class="alt" onclick="post('/api/telegram-test')">📨 Telegram test</button>
+  </div>
   <div class="kv" style="margin-top:10px"><span>Telegram bot</span><span id="tg">--</span></div>
  </div>
 
