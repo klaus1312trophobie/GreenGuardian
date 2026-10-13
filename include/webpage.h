@@ -145,6 +145,7 @@ function gauge(id,val,max,txt,unit,color,hint){
  <circle class="ring" cx="55" cy="55" r="${r}" stroke="${color}" stroke-dasharray="${c*p} ${c}"/></svg>
  <div><div class="val">${txt}<span class="unit"> ${unit}</span></div><div class="hint">${hint}</div></div>`;
 }
+const short=s=>s.replace('vegetative','veg.').replace('flowering','flower');
 const f=(v,d=1)=>v==null?'--':Number(v).toFixed(d);
 function ago(t,now){if(!t||!now)return'never';let s=now-t;if(s<3600)return Math.floor(s/60)+' min ago';if(s<86400)return Math.floor(s/3600)+' h ago';return Math.floor(s/86400)+' d '+Math.floor(s%86400/3600)+' h ago';}
 function upt(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return(d?d+'d ':'')+h+'h '+m+'m';}
@@ -158,7 +159,7 @@ function render(){
  gauge('g-soil',d.moisture,100,d.moisture==null?'--':d.moisture,'%',d.moisture!=null&&d.moisture<th?'var(--red)':'var(--green)',soilHint(d.moisture,th));
  gauge('g-temp',d.temp,40,f(d.temp),'°C','var(--gold)',tempHint(d.temp));
  gauge('g-hum',d.humidity,100,f(d.humidity),'%','var(--blue)',humHint(d.humidity));
- gauge('g-vpd',d.vpd,2,f(d.vpd,2),'kPa','var(--lime)',d.vpdStage);
+ gauge('g-vpd',d.vpd,2,f(d.vpd,2),'kPa','var(--lime)',short(d.vpdStage));
  const m=d.minmax;
  $('sMin').textContent=f(m.soilMin,0)+'%';$('sNow').textContent=(d.moisture??'--')+'%';$('sMax').textContent=f(m.soilMax,0)+'%';
  $('tMin').textContent=f(m.tempMin)+'°';$('tNow').textContent=f(d.temp)+'°';$('tMax').textContent=f(m.tempMax)+'°';
@@ -169,7 +170,7 @@ function render(){
  if(document.activeElement!==$('thr'))$('thr').value=th;
  if(document.activeElement!==$('rep'))$('rep').value=d.reportHour;
  $('tg').textContent=d.telegram?'✅ connected':'⚠️ not configured';
- $('dew').textContent=f(d.dewPoint)+' °C';$('hix').textContent=f(d.heatIndex)+' °C';$('vstage').textContent=d.vpdStage;
+ $('dew').textContent=f(d.dewPoint)+' °C';$('hix').textContent=f(d.heatIndex)+' °C';$('vstage').textContent=short(d.vpdStage);
  $('rssi').textContent=d.rssi?d.rssi+' dBm':'--';$('ip').textContent=d.ip;$('up').textContent=upt(d.uptime);$('heap').textContent=Math.round(d.freeHeap/1024)+' kB ('+Math.round(d.minHeap/1024)+' / '+Math.round(d.maxAlloc/1024)+')';$('derr').textContent=d.dhtErrors;
  $('clock').textContent=d.now?new Date(d.now*1000).toLocaleTimeString():'no time sync';
  const b=$('banner');
