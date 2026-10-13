@@ -92,7 +92,7 @@ footer{text-align:center;color:var(--mut);font-size:.8rem;margin:22px 0 6px}
  </div>
 
  <div class="card">
-  <h2>🚿 Watering &amp; Calibration</h2>
+  <h2>🚿 Water &amp; Sensor</h2>
   <button class="big" onclick="post('/api/calibrate?type=wet','Did you just water thoroughly? The current reading will become 100%.')">💧 Just watered &ndash; set 100%</button>
   <div class="kv"><span>Raw sensor value</span><span id="raw">--</span></div>
   <div class="kv"><span>Dry (0%) / Wet (100%)</span><span><span id="dry">--</span> / <span id="wet">--</span></span></div>
