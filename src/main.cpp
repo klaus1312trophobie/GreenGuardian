@@ -8,6 +8,7 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
+#include <esp_system.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
 #include <ArduinoJson.h>
@@ -27,6 +28,7 @@
 DHT dht(PIN_DHT, DHT22);
 Adafruit_SSD1306 oled(128, 64, &Wire, -1);
 WebServer server(80);
+const char *resetReasonText();
 WiFiClientSecure tgClient;
 UniversalTelegramBot bot(TELEGRAM_BOT_TOKEN, tgClient);
 Preferences prefs;
@@ -558,6 +560,7 @@ void handleData() {
   d["dhtOk"] = !isnan(avgTemp);
   d["dhtErrors"] = dhtErrors;
   d["warmingUp"] = samples < AVG_N;
+  d["resetReason"] = resetReasonText();
 
   String out;
   serializeJson(doc, out);
@@ -653,11 +656,34 @@ void setupWeb() {
 // ----------------------------------------------------------------------------
 //  WiFi
 // ----------------------------------------------------------------------------
+// Weak signal (~-80 dBm): modem sleep adds latency and packet loss, so keep the radio awake at full power.
+void wifiTune() {
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+}
+
+// Why did the chip (re)boot? Shown in the Telegram boot message and in /data.
+const char *resetReasonText() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_SW:        return "software restart";
+    case ESP_RST_PANIC:     return "crash (panic)";
+    case ESP_RST_INT_WDT:   return "interrupt watchdog";
+    case ESP_RST_TASK_WDT:  return "task watchdog";
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_BROWNOUT:  return "brownout (power supply!)";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_EXT:       return "reset pin";
+    default:                return "unknown";
+  }
+}
+
 void setupWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  wifiTune();
   bootScreen("Connecting WiFi...");
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(250);
@@ -679,11 +705,12 @@ void maintainWifi() {
   if (apActive && WiFi.status() == WL_CONNECTED) {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
+    wifiTune();
     apActive = false;
   }
   if (!bootMsgSent && WiFi.status() == WL_CONNECTED && tgEnabled()) {
     bootMsgSent = tgSend("🌱 <b>Green Guardian is online</b>\nDashboard: http://" + WiFi.localIP().toString() +
-                         "\nSend /help for commands.");
+                         "\nReset reason: " + String(resetReasonText()) + "\nSend /help for commands.");
   }
 }
 
@@ -694,6 +721,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== Green Guardian ===");
+  Serial.printf("Reset reason: %s\n", resetReasonText());
 
   analogReadResolution(12);
   analogSetPinAttenuation(PIN_SOIL, ADC_11db);
