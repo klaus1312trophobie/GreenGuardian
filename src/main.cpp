@@ -656,12 +656,6 @@ void setupWeb() {
 // ----------------------------------------------------------------------------
 //  WiFi
 // ----------------------------------------------------------------------------
-// Weak signal (~-80 dBm): modem sleep adds latency and packet loss, so keep the radio awake at full power.
-void wifiTune() {
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-}
-
 // Why did the chip (re)boot? Shown in the Telegram boot message and in /data.
 const char *resetReasonText() {
   switch (esp_reset_reason()) {
@@ -683,7 +677,6 @@ void setupWifi() {
   WiFi.setHostname(HOSTNAME);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  wifiTune();
   bootScreen("Connecting WiFi...");
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(250);
@@ -705,8 +698,7 @@ void maintainWifi() {
   if (apActive && WiFi.status() == WL_CONNECTED) {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
-    wifiTune();
-    apActive = false;
+      apActive = false;
   }
   if (!bootMsgSent && WiFi.status() == WL_CONNECTED && tgEnabled()) {
     bootMsgSent = tgSend("🌱 <b>Green Guardian is online</b>\nDashboard: http://" + WiFi.localIP().toString() +
