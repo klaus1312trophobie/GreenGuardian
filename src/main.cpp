@@ -695,10 +695,32 @@ void setupWifi() {
 }
 
 void maintainWifi() {
+  // setAutoReconnect() alone is unreliable (never retries if the first connect failed, or after
+  // some disconnect reasons) -> actively retry, and reboot if the link stays down for too long.
+  static uint32_t lostSince = 0, lastTry = 0;
+  uint32_t now = millis();
+  if (WiFi.status() == WL_CONNECTED) {
+    if (lostSince) Serial.printf("WiFi back after %lus\n", (unsigned long)((now - lostSince) / 1000));
+    lostSince = 0;
+  } else {
+    if (!lostSince) { lostSince = now; lastTry = now; Serial.println("WiFi lost"); }
+    if (now - lastTry >= 20000) {          // retry every 20 s
+      lastTry = now;
+      Serial.println("WiFi reconnect attempt");
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+    if (now - lostSince >= 10UL * 60UL * 1000UL) {   // 10 min without WiFi -> full restart
+      Serial.println("WiFi down for 10 min - restarting");
+      saveMinMax();
+      delay(200);
+      ESP.restart();
+    }
+  }
   if (apActive && WiFi.status() == WL_CONNECTED) {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
-      apActive = false;
+    apActive = false;
   }
   if (!bootMsgSent && WiFi.status() == WL_CONNECTED && tgEnabled()) {
     bootMsgSent = tgSend("🌱 <b>Green Guardian is online</b>\nDashboard: http://" + WiFi.localIP().toString() +
