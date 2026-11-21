@@ -20,6 +20,7 @@
 #include <SD_MMC.h>
 #include <esp_camera.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <time.h>
 
 #include "config.h"
@@ -96,6 +97,14 @@ String tgLastResult = "nothing sent yet";
 //  Helpers
 // ----------------------------------------------------------------------------
 bool timeValid() { return time(nullptr) > 1700000000; }
+
+// Loop watchdog: reboots if loop() hangs (camera driver, TLS, SD). Generous, because a
+// Telegram upload over a bad link legitimately takes a while; it is fed during long jobs.
+constexpr uint32_t WDT_TIMEOUT_S = 90;
+bool wdtOn = false;
+void feedWdt() { if (wdtOn) esp_task_wdt_reset(); }
+void wdtPause()  { if (wdtOn) { esp_task_wdt_delete(NULL); wdtOn = false; } }
+void wdtResume() { if (!wdtOn) { esp_task_wdt_add(NULL); wdtOn = true; } }
 bool tgEnabled() { return strlen(TELEGRAM_BOT_TOKEN) > 10 && strlen(TELEGRAM_CHAT_ID) > 0; }
 
 String timeStr(time_t t, const char *format) {
@@ -239,12 +248,14 @@ bool capture() {
   int drop = 2 + settleFrames;
   settleFrames = 0;
   for (int i = 0; i < drop; i++) {
+    feedWdt();                        // each grab can wait up to a few seconds
     camera_fb_t *old = esp_camera_fb_get();
     if (old) esp_camera_fb_return(old);
   }
   camera_fb_t *fb = nullptr;
   bool ok = false;
   for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+    feedWdt();
     fb = esp_camera_fb_get();
     ok = fb && fb->format == PIXFORMAT_JPEG && fb->len > 1024 && fb->buf[0] == 0xFF && fb->buf[1] == 0xD8;
     if (ok || attempt == 2) break;
@@ -295,7 +306,12 @@ bool mountSd() {
   if (sdOk) return true;
   // format_if_mount_failed = true: a card that cannot be read (unformatted, exFAT, ...) is
   // formatted to FAT. A card that mounts fine keeps its files.
-  if (!SD_MMC.begin("/sdcard", true, true)) {
+  // formatting a big card can take minutes -> watchdog off meanwhile
+  bool wasOn = wdtOn;
+  wdtPause();
+  bool mounted = SD_MMC.begin("/sdcard", true, true);
+  if (wasOn) wdtResume();
+  if (!mounted) {
     SD_MMC.end();
     return false;
   }
@@ -351,6 +367,9 @@ int tgSendShot(const String &caption) {
 
   WiFiClientSecure client;
   client.setInsecure();
+  client.setTimeout(8);              // seconds (Core 2.x); read/write timeouts
+  client.setHandshakeTimeout(12);    // default is 120 s -> would hang on a dead internet link
+  feedWdt();
   if (!client.connect("api.telegram.org", 443, 10000)) {
     tgLastResult = "connection to Telegram failed";
     return 0;
@@ -372,6 +391,7 @@ int tgSendShot(const String &caption) {
                "Connection: close\r\n\r\n");
   client.print(head);
   for (size_t off = 0; off < shot.len;) {
+    feedWdt();
     size_t n = min((size_t)2048, shot.len - off);
     size_t w = client.write(shot.buf + off, n);
     if (w == 0) {
@@ -389,6 +409,7 @@ int tgSendShot(const String &caption) {
   while (millis() - t0 < 20000 && (client.connected() || client.available())) {
     while (client.available() && resp.length() < 2000) resp += (char)client.read();
     if (resp.indexOf("\"ok\":") >= 0) break;
+    feedWdt();
     delay(10);
   }
   client.stop();
@@ -722,23 +743,40 @@ void setup() {
 
   ArduinoOTA.setHostname(CAM_HOSTNAME);
   ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([] { wdtPause(); });                  // the upload blocks loop() for a while
+  ArduinoOTA.onError([](ota_error_t) { wdtResume(); });    // aborted update: watchdog back on
   ArduinoOTA.begin();
   MDNS.addService("http", "tcp", 80);
 
   setupWeb();
+
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  wdtResume();
+}
+
+// Heap guard: Telegram TLS needs ~40 KB in one piece. If internal RAM fragments that far,
+// restart cleanly (settings and the photo counter live in flash, nothing is lost).
+void checkHeap() {
+  if (ESP.getFreeHeap() < 30000 || ESP.getMaxAllocHeap() < 16000) {
+    Serial.printf("Low heap (free %u, block %u) - restarting\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    delay(200);
+    ESP.restart();
+  }
 }
 
 void loop() {
-  static uint32_t tWifi = 0, tBeat = 0, tDaily = 0, tCamRetry = 0;
+  static uint32_t tWifi = 0, tBeat = 0, tDaily = 0, tCamRetry = 0, tHeap = 0;
   static bool sdTried = false;
   uint32_t now = millis();
 
+  feedWdt();
   server.handleClient();
   ArduinoOTA.handle();
 
   if (now - tWifi >= 10000) { tWifi = now; maintainWifi(); }
   if (now - tBeat >= CAM_HEARTBEAT_S * 1000UL || tBeat == 0) { tBeat = now ? now : 1; sendHeartbeat(); }
   if (now - tDaily >= 30000) { tDaily = now; checkDailyPhoto(); }
+  if (now - tHeap >= 60000) { tHeap = now; checkHeap(); }
   // SD card only after the network is up: formatting an unreadable card can take a while
   // and must not keep the camera off the network.
   if (!sdTried && tBeat) {
