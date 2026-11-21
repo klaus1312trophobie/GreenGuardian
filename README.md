@@ -9,6 +9,7 @@ OLED and a web dashboard, and sends alerts and reports via Telegram.
 - Automatic watering detection (sudden rise in soil moisture)
 - OLED with rotating pages (mounted upside down, `setRotation(2)`)
 - OTA updates over WiFi, settings stored in NVS (survive updates and reboots)
+- Optional tent camera (ESP32-CAM): picture in the dashboard, daily Telegram photo, SD archive – see [Tent camera](#tent-camera)
 - Android home-screen widget: [PflanzenWidget](https://github.com/klaus1312trophobie/PflanzenWidget)
 
 ## Parts list
@@ -146,4 +147,47 @@ The keys `moisture`, `temp` and `humidity` are used by the Android widget and mu
 |---------|--------|
 | `/status` | current values, min/max, last watering |
 | `/watered` | log a watering manually |
+| `/photo` | picture from the tent camera (if installed) |
 | `/help` | command list and dashboard link |
+
+## Tent camera
+
+Optional second board: an AI-Thinker ESP32-CAM (OV2640) running the firmware in `cam/`.
+It reads WiFi, Telegram and OTA settings from the same `include/config.h`.
+
+- Full-resolution still (1600×1200) on demand – no video stream, so the sensor stays cool
+- Daily photo to the Telegram chat at 13:00 (`CAM_PHOTO_HOUR`); every photo sent to
+  Telegram is also stored on the SD card in `/tent/` (a card that cannot be read is formatted)
+- Dashboard card with the current picture (refreshed every 10 min, `CAM_SNAPSHOT_MAX_AGE_S`),
+  "New picture", "Send to Telegram" and a link to the SD card photos
+- `/photo` in Telegram: the sensor ESP32 receives the command and asks the camera for a picture
+- Flash LED (GPIO 4) and status LED stay off
+
+How the two boards work together: the camera broadcasts a small UDP heartbeat every 20 s
+(port 4210). The sensor ESP32 learns the camera's IP from it and publishes it in `/data`
+(`cam` object); the browser then loads the picture directly from the camera. Only the
+sensor ESP32 polls Telegram – the camera just sends – so the two never steal each other's
+bot updates.
+
+Flash (ESP32-CAM on the ESP32-CAM-MB USB board):
+
+```
+cd cam
+pio run -e esp32cam_usb -t upload     # first time, via USB
+pio run -e esp32cam -t upload         # later, via WiFi (OTA)
+```
+
+Camera endpoints (`http://greenguardian-cam.local`):
+
+| Path | Action |
+|------|--------|
+| `/` | picture + buttons |
+| `/snapshot.jpg` | last picture, re-taken if older than 10 min (`?fresh=1` = take a new one now) |
+| `/status` | JSON status (sensor, SD card, last Telegram result, reset reason) |
+| `/api/tune` | picture tuning without re-flashing: `?sharpness=4&gainceiling=0&ae_level=0&aec2=1&saturation=0&contrast=0&brightness=0&quality=4`, `?reset=1` = sensor defaults; also on the camera's own page |
+| `/sd` | photos stored on the SD card |
+| `POST /api/telegram-photo` | take a picture, store it on the SD card and send it to Telegram |
+
+Orientation: set `CAM_VFLIP` / `CAM_HMIRROR` in `config.h` if the picture is upside down or mirrored.
+
+Printable case (PETG) and 19 mm tent-pole clip: see `cam/case/`.

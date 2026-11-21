@@ -50,6 +50,8 @@ label{display:flex;justify-content:space-between;align-items:center;margin:8px 0
 .kv span:first-child{color:var(--mut)}
 .wide{grid-column:1/-1}
 canvas{width:100%;height:260px;display:block}
+#camImg{width:100%;display:block;border-radius:12px;border:1px solid var(--line);margin-bottom:10px;cursor:zoom-in}
+#camImg:not([src]){display:none}
 .legend{display:flex;gap:16px;font-size:.85rem;color:var(--mut);margin-bottom:6px;flex-wrap:wrap}
 .legend i{display:inline-block;width:12px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}
 #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(100px);background:#1d3b22;border:1px solid var(--green);padding:12px 18px;border-radius:12px;transition:.3s;z-index:9}
@@ -78,6 +80,20 @@ footer{text-align:center;color:var(--mut);font-size:.8rem;margin:22px 0 6px}
   <h2>📈 Last 24 hours</h2>
   <div class="legend"><span><i style="background:var(--green)"></i>Soil %</span><span><i style="background:var(--gold)"></i>Temp °C</span><span><i style="background:var(--blue)"></i>Humidity %</span><span><i style="background:var(--red)"></i>Water threshold</span></div>
   <canvas id="chart"></canvas>
+ </div>
+
+ <div class="card wide" id="camCard" style="display:none">
+  <h2>📷 Tent Camera</h2>
+  <img id="camImg" alt="Tent camera picture" onclick="if(this.src)open(this.src)" onerror="camErr()">
+  <div class="kv"><span>Camera</span><span id="camState">--</span></div>
+  <div class="kv"><span>Picture</span><span id="camShot">--</span></div>
+  <div class="kv"><span>Telegram photo</span><span id="camTg">--</span></div>
+  <div class="btns">
+  <button class="alt" onclick="camLoad(true)">🔄 New picture</button>
+  <button class="alt" onclick="camSend()">📨 Send to Telegram</button>
+  <button class="alt" onclick="camOpen('/sd')">💾 SD card photos</button>
+  <button class="alt" onclick="camOpen('/')">⚙️ Picture tuning</button>
+  </div>
  </div>
 
  <div class="card">
@@ -178,6 +194,7 @@ function render(){
  $('dew').textContent=f(d.dewPoint)+' °C';$('hix').textContent=f(d.heatIndex)+' °C';$('vstage').textContent=short(d.vpdStage);
  $('rssi').textContent=d.rssi?d.rssi+' dBm':'--';$('ip').textContent=d.ip;$('up').textContent=upt(d.uptime);$('heap').textContent=Math.round(d.freeHeap/1024)+' kB ('+Math.round(d.minHeap/1024)+' / '+Math.round(d.maxAlloc/1024)+')';$('derr').textContent=d.dhtErrors;
  $('clock').textContent=d.now?new Date(d.now*1000).toLocaleTimeString():'no time sync';
+ camRender();
  const b=$('banner');
  if(d.warmingUp){b.className='banner';b.textContent='⏳ Warming up sensors (10 s average)...';}
  else if(d.moisture!=null&&d.moisture<th){b.className='banner dry';b.textContent=`🥵 Your girls are thirsty! Soil at ${d.moisture}% – time to water 💧`;}
@@ -208,6 +225,27 @@ function chart(){
   g.stroke();
  });
  if(H.length){const p=H[H.length-1];if(p[1]!=null){g.fillStyle='#5fd068';g.beginPath();g.arc(X(p,H.length-1),Y(p[1]),4,0,7);g.fill();}}
+}
+
+// --- tent camera: the picture comes straight from the camera ESP32, this page only knows its IP ---
+let camNext=0,camFail=false;
+const camUrl=p=>'http://'+D.cam.ip+p;
+function camLoad(fresh){
+ if(!D||!D.cam||!D.cam.ip)return;
+ camFail=false;camNext=Date.now()+(D.cam.refresh||600)*1000;
+ $('camImg').src=camUrl('/snapshot.jpg?'+(fresh?'fresh=1&':'')+'t='+Date.now());
+ if(fresh)toast('📷 Taking a new picture...');
+}
+function camErr(){camFail=true;$('camImg').removeAttribute('src');camNext=Date.now()+30000;}
+function camSend(){if(D&&D.cam&&D.cam.ip)post(camUrl('/api/telegram-photo'));}
+function camOpen(p){if(D&&D.cam&&D.cam.ip)open(camUrl(p));}
+function camRender(){
+ const c=D.cam;if(!c||!c.ip)return;
+ $('camCard').style.display='';
+ $('camState').textContent=c.online?(c.sensorOk?'🟢 online':'⚠️ online, sensor not found')+' · '+c.ip+' · '+c.rssi+' dBm'+(c.sd?' · SD ✅':' · no SD'):'🔴 offline · last seen at '+c.ip;
+ $('camShot').textContent=camFail?'⚠️ camera not reachable from this device':c.bytes?(c.shot?new Date(c.shot*1000).toLocaleString()+' · ':'')+c.w+'×'+c.h+' · '+Math.round(c.bytes/1024)+' kB':'--';
+ $('camTg').textContent=c.photoHour==null?'--':(c.photoHour<0?'daily photo off':'daily at '+c.photoHour+':00')+' · last sent: '+(c.lastTg?new Date(c.lastTg*1000).toLocaleString():'--');
+ if(c.online&&Date.now()>=camNext)camLoad(false);
 }
 
 function toast(m){const t=$('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3200);}

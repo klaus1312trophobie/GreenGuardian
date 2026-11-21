@@ -2,9 +2,11 @@
 //  Green Guardian – Cannabis grow monitor for ESP32
 //  DHT22 (temp/humidity) + capacitive soil moisture sensor + 0.96" SSD1306 OLED
 //  Web dashboard, Telegram bot, 10 s rolling averages, min/max, 24 h history
+//  Optional tent camera (second ESP32-CAM, firmware in cam/) shown in the dashboard
 // =============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
@@ -20,6 +22,7 @@
 #include <time.h>
 
 #include "config.h"
+#include "cam_link.h"
 #include "webpage.h"
 
 // ----------------------------------------------------------------------------
@@ -109,6 +112,69 @@ int waterWindow[6];
 int waterWindowIdx = 0, waterWindowCount = 0;
 
 // ----------------------------------------------------------------------------
+//  Tent camera link (cam/): the camera broadcasts a UDP heartbeat, we remember
+//  where it is and what it last did. The browser loads the picture directly
+//  from the camera, so no image data passes through this ESP32.
+// ----------------------------------------------------------------------------
+WiFiUDP camUdp;
+struct CamLink {
+  IPAddress ip;
+  bool known = false;        // a camera has been seen at some point (IP is kept in flash)
+  uint32_t seenMs = 0;       // millis() of the last heartbeat, 0 = not seen since boot
+  int rssi = 0;
+  uint32_t shot = 0, bytes = 0, lastTg = 0, uptime = 0;
+  int w = 0, h = 0, refresh = CAM_SNAPSHOT_MAX_AGE_S, photoHour = CAM_PHOTO_HOUR;
+  bool sd = false, sensorOk = false;
+} cam;
+
+bool camOnline() { return cam.seenMs && millis() - cam.seenMs < CAM_OFFLINE_AFTER_S * 1000UL; }
+
+void pollCamLink() {
+  int len = camUdp.parsePacket();
+  if (len <= 0) return;
+  char buf[300];
+  int n = camUdp.read(buf, sizeof(buf) - 1);
+  IPAddress from = camUdp.remoteIP();
+  camUdp.flush();
+  if (n <= 0) return;
+  buf[n] = 0;
+  JsonDocument doc;
+  if (deserializeJson(doc, buf) || doc["m"] != CAM_LINK_MAGIC) return;
+  if (!cam.known || cam.ip != from) {          // remember the camera across restarts
+    prefs.begin("guardian", false);
+    prefs.putUInt("camIp", (uint32_t)from);
+    prefs.end();
+  }
+  cam.ip = from;
+  cam.known = true;
+  cam.seenMs = millis() ? millis() : 1;
+  cam.rssi = doc["rssi"] | 0;
+  cam.uptime = doc["up"] | 0;
+  cam.shot = doc["shot"] | 0;
+  cam.bytes = doc["bytes"] | 0;
+  cam.w = doc["w"] | 0;
+  cam.h = doc["h"] | 0;
+  cam.refresh = doc["refresh"] | CAM_SNAPSHOT_MAX_AGE_S;
+  cam.photoHour = doc["hour"] | CAM_PHOTO_HOUR;
+  cam.lastTg = doc["tg"] | 0;
+  cam.sd = doc["sd"] | false;
+  cam.sensorOk = doc["ok"] | false;
+}
+
+// Asks the camera to take a picture and send it to Telegram itself (it answers at once
+// and does the work afterwards, so this never blocks for long).
+bool camRequestPhoto() {
+  if (!camOnline()) return false;
+  WiFiClient c;
+  if (!c.connect(cam.ip, 80, 1500)) return false;
+  c.print("POST /api/telegram-photo HTTP/1.1\r\nHost: " CAM_HOSTNAME "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+  c.setTimeout(3);                       // seconds
+  String status = c.readStringUntil('\n');
+  c.stop();
+  return status.indexOf(" 200") > 0;
+}
+
+// ----------------------------------------------------------------------------
 //  Helpers
 // ----------------------------------------------------------------------------
 bool timeValid() { return time(nullptr) > 1700000000; }
@@ -180,7 +246,9 @@ void loadSettings() {
   mmHum.lo  = prefs.getFloat("hLo", NAN); mmHum.hi  = prefs.getFloat("hHi", NAN);
   mmSoil.lo = prefs.getFloat("sLo", NAN); mmSoil.hi = prefs.getFloat("sHi", NAN);
   mmSince = prefs.getULong("mmSince", 0);
+  uint32_t camIp = prefs.getUInt("camIp", 0);
   prefs.end();
+  if (camIp) { cam.ip = IPAddress(camIp); cam.known = true; }
 }
 
 void saveSettings() {
@@ -276,10 +344,14 @@ void pollTelegram() {
       } else if (cmd.startsWith("/watered")) {
         markWatered(false);
         tgSend("🚿 Watering logged. 💚");
+      } else if (cmd.startsWith("/photo")) {
+        // on success the camera sends the picture itself - no extra message needed
+        if (!camRequestPhoto()) tgSend("📷 The tent camera is offline.");
       } else {
         String help = "🌿 <b>Green Guardian</b>\n\n"
                       "/status – current values\n"
                       "/watered – log a watering\n"
+                      "/photo – picture from the tent camera\n"
                       "/help – this message\n\n"
                       "Dashboard: http://" + WiFi.localIP().toString() + "  or  http://" HOSTNAME ".local";
         tgSend(help);
@@ -562,6 +634,23 @@ void handleData() {
   d["warmingUp"] = samples < AVG_N;
   d["resetReason"] = resetReasonText();
 
+  JsonObject c = d["cam"].to<JsonObject>();
+  c["online"] = camOnline();
+  if (cam.known) c["ip"] = cam.ip.toString();
+  if (cam.seenMs) {
+    c["rssi"] = cam.rssi;
+    c["shot"] = cam.shot;
+    c["bytes"] = cam.bytes;
+    c["w"] = cam.w;
+    c["h"] = cam.h;
+    c["refresh"] = cam.refresh;
+    c["photoHour"] = cam.photoHour;
+    c["lastTg"] = cam.lastTg;
+    c["sd"] = cam.sd;
+    c["sensorOk"] = cam.sensorOk;
+    c["uptime"] = cam.uptime;
+  }
+
   String out;
   serializeJson(doc, out);
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -766,6 +855,7 @@ void setup() {
   MDNS.addService("http", "tcp", 80);
 
   setupWeb();
+  camUdp.begin(CAM_LINK_PORT);
 }
 
 // Heap fragmentation guard: restart if memory gets critically low (settings live in NVS, so nothing is lost)
@@ -780,7 +870,7 @@ void checkHeap() {
 
 void loop() {
   static uint32_t tSample = 0, tPage = 0, tRedraw = 0, tHist = 0, tWater = 0,
-                  tAlert = 0, tTg = 0, tPersist = 0, tDaily = 0, tHeap = 0;
+                  tAlert = 0, tTg = 0, tPersist = 0, tDaily = 0, tHeap = 0, tCam = 0;
   static bool histSeeded = false;
   uint32_t now = millis();
 
@@ -788,6 +878,7 @@ void loop() {
   ArduinoOTA.handle();
 
   if (now - tSample >= 1000) { tSample = now; sampleSensors(); }
+  if (now - tCam >= 250) { tCam = now; pollCamLink(); }
 
   if (oledOk) {
     if (now - tPage >= 3000) {

@@ -35,3 +35,14 @@
 #define TEMP_HIGH_ALERT    32.0f
 #define TEMP_LOW_ALERT     15.0f
 #define LEAF_TEMP_OFFSET   2.0f      // leaf is ~2 °C cooler than air (for VPD)
+
+// --- Tent camera (optional second board: ESP32-CAM, firmware in cam/) ---
+// Uses the WiFi, Telegram and OTA settings above. Defaults are in cam_link.h;
+// uncomment a line to change it (then re-flash both boards).
+//#define CAM_HOSTNAME           "greenguardian-cam"  // -> http://greenguardian-cam.local
+//#define CAM_PHOTO_HOUR         13    // daily Telegram photo, -1 = off
+//#define CAM_SNAPSHOT_MAX_AGE_S 600   // dashboard picture refresh interval in seconds
+//#define CAM_JPEG_QUALITY       8     // 0-63, lower = better quality
+//#define CAM_VFLIP              1     // picture upside down
+//#define CAM_HMIRROR            1     // picture mirrored
+//#define CAM_TELEGRAM_AS_FILE   1     // send as file: Telegram keeps the original JPEG
