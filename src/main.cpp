@@ -11,15 +11,18 @@
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <DHT.h>
 #include <time.h>
+#include <algorithm>
 
 #include "config.h"
 #include "cam_link.h"
@@ -276,9 +279,27 @@ void saveMinMax() {
 // ----------------------------------------------------------------------------
 bool tgEnabled() { return strlen(TELEGRAM_BOT_TOKEN) > 10 && strlen(TELEGRAM_CHAT_ID) > 0; }
 
+// Loop watchdog: a TLS call to Telegram can take a while (DNS 15 s + connect + handshake),
+// so the timeout is generous; it only fires if the loop is really stuck.
+constexpr uint32_t WDT_TIMEOUT_S = 90;
+void feedWdt() { esp_task_wdt_reset(); }
+
+// Internet outage (WiFi up, Telegram unreachable): back off instead of blocking the loop
+// with a full connect timeout every 8 s.
+uint8_t tgFailures = 0;
+uint32_t tgRetryAt = 0;
+bool tgBackingOff() { return tgFailures >= 2 && (int32_t)(millis() - tgRetryAt) < 0; }
+void tgResult(bool ok) {
+  if (ok) { tgFailures = 0; return; }
+  if (tgFailures < 10) tgFailures++;
+  uint32_t wait = min<uint32_t>(8000UL << min<uint8_t>(tgFailures, 5), 180000UL);  // 16 / 32 / 64 / 128 / 180 s
+  tgRetryAt = millis() + wait;
+}
+
 // Single-shot send: bot.sendMessage() re-POSTs for up to 8 s when the reply is slow
 // (weak WiFi), which delivered the same message 2-3 times.
 bool tgSendTo(const String &chatId, const String &msg, const char *parseMode = "HTML") {
+  feedWdt();
   JsonDocument doc;
   JsonObject payload = doc.to<JsonObject>();
   payload["chat_id"] = chatId;
@@ -286,7 +307,10 @@ bool tgSendTo(const String &chatId, const String &msg, const char *parseMode = "
   if (strlen(parseMode)) payload["parse_mode"] = parseMode;
   String response = bot.sendPostToTelegram(bot.buildCommand("sendMessage"), payload);
   tgClient.stop();
-  return bot.checkForOkResponse(response);
+  feedWdt();
+  bool ok = bot.checkForOkResponse(response);
+  tgResult(ok || response.length() > 0);   // any answer means the internet works
+  return ok;
 }
 
 // Returns the real result (Telegram confirmed delivery); used by the dashboard test button.
@@ -296,8 +320,9 @@ bool tgSendChecked(const String &msg) {
 }
 
 // Fire-and-forget for alerts/reports: never retry, a lost reply usually still means delivered.
+// Returns false only if nothing was attempted (no WiFi / internet known down), so alerts retry later.
 bool tgSend(const String &msg) {
-  if (!tgEnabled() || WiFi.status() != WL_CONNECTED) return false;
+  if (!tgEnabled() || WiFi.status() != WL_CONNECTED || tgBackingOff()) return false;
   tgSendTo(TELEGRAM_CHAT_ID, msg);
   return true;
 }
@@ -328,9 +353,16 @@ void markWatered(bool notify) {
 }
 
 void pollTelegram() {
-  if (!tgEnabled() || WiFi.status() != WL_CONNECTED) return;
+  if (!tgEnabled() || WiFi.status() != WL_CONNECTED || tgBackingOff()) return;
+  feedWdt();
+  // getUpdates() returns 0 on errors too, so connect here first to know if Telegram is
+  // reachable at all (the library reuses an open connection).
+  bool reachable = tgClient.connected() || tgClient.connect("api.telegram.org", 443);
+  tgResult(reachable);
+  if (!reachable) { tgClient.stop(); feedWdt(); return; }
   int n = bot.getUpdates(bot.last_message_received + 1);
-  while (n) {
+  for (int round = 0; n; round++) {
+    feedWdt();
     for (int i = 0; i < n; i++) {
       telegramMessage &m = bot.messages[i];
       if (m.chat_id != TELEGRAM_CHAT_ID) {
@@ -357,26 +389,75 @@ void pollTelegram() {
         tgSend(help);
       }
     }
-    n = bot.getUpdates(bot.last_message_received + 1);
+    // bounded: never get stuck in here. Only fetch more if they will be handled too,
+    // getUpdates() already marks them as read.
+    n = round < 4 ? bot.getUpdates(bot.last_message_received + 1) : 0;
   }
+  tgClient.stop();   // frees ~40 KB of TLS buffers until the next poll
+  feedWdt();
 }
 
 // ----------------------------------------------------------------------------
 //  Sensors
 // ----------------------------------------------------------------------------
+// 16 ADC reads, sorted; the 4 lowest and 4 highest are dropped (ESP32 ADC noise spikes)
 int readSoilRaw() {
-  uint32_t sum = 0;
-  for (int i = 0; i < 16; i++) { sum += analogRead(PIN_SOIL); delayMicroseconds(200); }
-  return sum / 16;
+  int v[16];
+  for (int i = 0; i < 16; i++) { v[i] = analogRead(PIN_SOIL); delayMicroseconds(200); }
+  std::sort(v, v + 16);
+  int sum = 0;
+  for (int i = 4; i < 12; i++) sum += v[i];
+  return sum / 8;
 }
+
+// Outlier filter: a sample that jumps further than maxJump from the last accepted one is
+// dropped, unless the new level holds for SPIKE_CONFIRM samples in a row (real change,
+// e.g. watering or the light switching on).
+constexpr int SPIKE_CONFIRM = 3;
+struct SpikeFilter {
+  float last = NAN, candidate = NAN;
+  int pending = 0;
+  bool accept(float x, float maxJump) {
+    if (isnan(last) || fabsf(x - last) <= maxJump) { last = x; pending = 0; return true; }
+    // the new level only counts if the outliers agree with each other
+    if (pending && fabsf(x - candidate) <= maxJump) pending++;
+    else { candidate = x; pending = 1; }
+    if (pending >= SPIKE_CONFIRM) { last = x; pending = 0; return true; }
+    return false;
+  }
+};
+SpikeFilter tempFilter, humFilter, rawFilter;
+
+// Failed / implausible DHT reads keep the last good values; only after this long without
+// a single good reading do the values go to "--".
+constexpr uint32_t DHT_HOLD_MS = 60000;
+uint32_t dhtLastOkMs = 0;
+uint32_t dhtFailStreak = 0;
 
 void sampleSensors() {
   float t = dht.readTemperature();
   float h = dht.readHumidity();
-  if (isnan(t) || isnan(h)) { dhtErrors++; t = h = NAN; }
-  tempRing.push(t);
-  humRing.push(h);
-  rawRing.push(readSoilRaw());
+  bool plausible = !isnan(t) && !isnan(h) && t > -20 && t < 70 && h > 0 && h <= 100;   // 0/0 is a typical DHT glitch
+  if (plausible) {
+    bool tOk = tempFilter.accept(t, 3.0f);   // °C per second
+    bool hOk = humFilter.accept(h, 10.0f);   // % RH per second
+    if (tOk && hOk) {
+      tempRing.push(t);
+      humRing.push(h);
+      dhtLastOkMs = millis();
+      dhtFailStreak = 0;
+    }
+  } else {
+    dhtErrors++;
+    if (++dhtFailStreak % 30 == 0) dht.begin();   // re-init the bus after 30 failures in a row
+  }
+  if (millis() - dhtLastOkMs > DHT_HOLD_MS) {      // sensor gone: stop showing stale values
+    tempRing = Ring(); humRing = Ring();
+    tempFilter = SpikeFilter(); humFilter = SpikeFilter();
+  }
+
+  int raw = readSoilRaw();
+  if (rawFilter.accept(raw, 400)) rawRing.push(raw);
   if (samples < AVG_N) samples++;
 
   avgTemp = tempRing.avg();
@@ -401,6 +482,46 @@ void recordHistory() {
   p.hum10 = isnan(avgHum) ? NO_VAL : (int16_t)lroundf(avgHum * 10);
   histHead = (histHead + 1) % HIST_N;
   if (histCount < HIST_N) histCount++;
+}
+
+// 24 h history survives restarts / power cuts: saved to the flash file system every 15 min
+// (and before planned restarts), written to a temp file first so a power cut can't corrupt it.
+constexpr uint32_t HIST_MAGIC = 0x47474831;   // "GGH1"
+bool fsOk = false;
+
+void saveHistory() {
+  if (!fsOk) return;
+  File f = LittleFS.open("/hist.tmp", "w");
+  if (!f) return;
+  uint32_t hdr[3] = {HIST_MAGIC, (uint32_t)histHead, (uint32_t)histCount};
+  bool ok = f.write((const uint8_t *)hdr, sizeof(hdr)) == sizeof(hdr) &&
+            f.write((const uint8_t *)hist, sizeof(hist)) == sizeof(hist);
+  f.close();
+  if (ok) LittleFS.rename("/hist.tmp", "/hist.bin");   // replaces the old file atomically
+}
+
+void loadHistory() {
+  if (!fsOk) return;
+  const char *path = LittleFS.exists("/hist.bin") ? "/hist.bin" : "/hist.tmp";
+  File f = LittleFS.open(path, "r");
+  if (!f) return;
+  uint32_t hdr[3];
+  if (f.size() == sizeof(hdr) + sizeof(hist) && f.read((uint8_t *)hdr, sizeof(hdr)) == sizeof(hdr) &&
+      hdr[0] == HIST_MAGIC && hdr[1] < (uint32_t)HIST_N && hdr[2] <= (uint32_t)HIST_N &&
+      f.read((uint8_t *)hist, sizeof(hist)) == sizeof(hist)) {
+    histHead = hdr[1];
+    histCount = hdr[2];
+    Serial.printf("History restored: %d points\n", histCount);
+  } else {
+    histHead = histCount = 0;
+  }
+  f.close();
+}
+
+// everything that should survive a restart but isn't saved on every change
+void persistAll() {
+  saveMinMax();
+  saveHistory();
 }
 
 void checkWatering() {
@@ -520,7 +641,7 @@ void drawLeafPage() {
   centerText("~ stay green ~", 56, 1);
 }
 
-void drawPage(int page, bool blink) {
+void renderPage(int page, bool blink) {
   oled.clearDisplay();
   oled.setTextColor(SSD1306_WHITE);
   switch (page) {
@@ -572,12 +693,83 @@ void drawPage(int page, bool blink) {
       drawLeafPage();
       break;
   }
+}
+
+void drawPage(int page, bool blink) {
+  renderPage(page, blink);
   oled.display();
 }
 
 // page sequence: soil, temp, hum, vpd, soil, temp, hum, vpd, leaf ...
 const int PAGE_SEQ[] = {0, 1, 2, 3, 0, 1, 2, 3, 4};
+constexpr int PAGE_SEQ_N = sizeof(PAGE_SEQ) / sizeof(PAGE_SEQ[0]);
 int pageSeqIdx = 0;
+
+// ----------------------------------------------------------------------------
+//  OLED page transitions (non-blocking, one frame per loop pass)
+//  old and new page are rendered into two frame buffers and blended per pixel
+// ----------------------------------------------------------------------------
+enum Transition { TR_SLIDE, TR_PUSH_UP, TR_DISSOLVE };
+constexpr int TR_FRAMES = 12;
+constexpr uint32_t TR_FRAME_MS = 15;
+uint8_t fbFrom[128 * 64 / 8], fbTo[128 * 64 / 8];
+Transition trType = TR_SLIDE;
+int trStep = -1;                 // -1 = no transition running
+uint32_t trLastMs = 0;
+
+// pixel of a saved frame buffer in logical (rotated 180°) coordinates
+inline bool fbPixel(const uint8_t *b, int x, int y) {
+  x = 127 - x; y = 63 - y;
+  return (b[x + (y >> 3) * 128] >> (y & 7)) & 1;
+}
+
+inline uint8_t dissolveRank(int x, int y) {   // fixed pseudo-random order of the pixels
+  uint32_t h = (uint32_t)(x * 73 + y * 151) ^ (uint32_t)(x * y * 31);
+  return (h * 2654435761UL) >> 24;
+}
+
+void startTransition(int fromPage, int toPage, bool blink) {
+  memcpy(fbFrom, oled.getBuffer(), sizeof(fbFrom));   // what is on screen right now
+  renderPage(toPage, blink);
+  memcpy(fbTo, oled.getBuffer(), sizeof(fbTo));
+  if (fromPage == 4 || toPage == 4) trType = TR_DISSOLVE;   // leaf page fades in / out
+  else if (toPage == 0) trType = TR_PUSH_UP;                // new round starts from below
+  else trType = TR_SLIDE;
+  trStep = 0;
+  trLastMs = 0;
+}
+
+void stepTransition() {
+  trStep++;
+  float p = (float)trStep / TR_FRAMES;
+  float e = 1 - (1 - p) * (1 - p) * (1 - p);   // ease-out cubic
+  oled.clearDisplay();
+  if (trType == TR_SLIDE) {
+    int k = lroundf(e * 128);
+    for (int y = 0; y < 64; y++)
+      for (int x = 0; x < 128; x++) {
+        int sx = x + k;
+        if (sx < 128 ? fbPixel(fbFrom, sx, y) : fbPixel(fbTo, sx - 128, y)) oled.drawPixel(x, y, SSD1306_WHITE);
+      }
+  } else if (trType == TR_PUSH_UP) {
+    int k = lroundf(e * 64);
+    for (int y = 0; y < 64; y++)
+      for (int x = 0; x < 128; x++) {
+        int sy = y + k;
+        if (sy < 64 ? fbPixel(fbFrom, x, sy) : fbPixel(fbTo, x, sy - 64)) oled.drawPixel(x, y, SSD1306_WHITE);
+      }
+  } else {
+    int limit = lroundf(p * 256);
+    for (int y = 0; y < 64; y++)
+      for (int x = 0; x < 128; x++)
+        if (dissolveRank(x, y) < limit ? fbPixel(fbTo, x, y) : fbPixel(fbFrom, x, y)) oled.drawPixel(x, y, SSD1306_WHITE);
+  }
+  if (trStep >= TR_FRAMES) {
+    memcpy(oled.getBuffer(), fbTo, sizeof(fbTo));   // land exactly on the new page
+    trStep = -1;
+  }
+  oled.display();
+}
 
 void bootScreen(const String &line) {
   if (!oledOk) return;
@@ -663,14 +855,25 @@ void handleHistory() {
   server.sendContent("[");
   String chunk;
   int start = (histHead - histCount + HIST_N) % HIST_N;
+  // points recorded before NTP sync have t = 0; once the history has real timestamps they
+  // would break the chart's time axis, so leave them out
+  bool newestTimed = histCount && hist[(histHead - 1 + HIST_N) % HIST_N].t > 0;
+  bool first = true;
   for (int i = 0; i < histCount; i++) {
     const HistPoint &p = hist[(start + i) % HIST_N];
-    chunk += i ? ",[" : "[";
+    if (newestTimed && p.t == 0) continue;
+    chunk += first ? "[" : ",[";
+    first = false;
     chunk += String(p.t) + ",";
     chunk += (p.soil == NO_VAL ? String("null") : String(p.soil)) + ",";
     chunk += (p.temp10 == NO_VAL ? String("null") : String(p.temp10 / 10.0f, 1)) + ",";
     chunk += (p.hum10 == NO_VAL ? String("null") : String(p.hum10 / 10.0f, 1)) + "]";
-    if (chunk.length() > 1024) { server.sendContent(chunk); chunk = ""; }
+    if (chunk.length() > 1024) {
+      feedWdt();
+      if (!server.client().connected()) return;   // browser gone (e.g. phone left the WiFi)
+      server.sendContent(chunk);
+      chunk = "";
+    }
   }
   chunk += "]";
   server.sendContent(chunk);
@@ -801,7 +1004,7 @@ void maintainWifi() {
     }
     if (now - lostSince >= 10UL * 60UL * 1000UL) {   // 10 min without WiFi -> full restart
       Serial.println("WiFi down for 10 min - restarting");
-      saveMinMax();
+      persistAll();
       delay(200);
       ESP.restart();
     }
@@ -843,26 +1046,40 @@ void setup() {
   delay(1500);
 
   loadSettings();
+  fsOk = LittleFS.begin(true);   // formats the partition on first use
+  if (!fsOk) Serial.println("LittleFS mount failed - history won't survive restarts");
+  loadHistory();
   setupWifi();
 
   configTzTime(TZ_INFO, NTP_SERVER);
   tgClient.setInsecure();
+  // defaults are 30 s connect + 120 s TLS handshake -> would trip the watchdog on a dead link
+  tgClient.setTimeout(8);             // seconds (Core 2.x)
+  tgClient.setHandshakeTimeout(12);   // seconds
 
   ArduinoOTA.setHostname(HOSTNAME);
   ArduinoOTA.setPassword(OTA_PASSWORD);
-  ArduinoOTA.onStart([] { bootScreen("OTA update..."); });
+  ArduinoOTA.onStart([] {
+    esp_task_wdt_delete(NULL);   // the upload blocks loop() for a while
+    persistAll();
+    bootScreen("OTA update...");
+  });
+  ArduinoOTA.onError([](ota_error_t) { esp_task_wdt_add(NULL); });   // aborted update: watchdog back on
   ArduinoOTA.begin();
   MDNS.addService("http", "tcp", 80);
 
   setupWeb();
   camUdp.begin(CAM_LINK_PORT);
+
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);   // reboot if loop() hangs
+  esp_task_wdt_add(NULL);
 }
 
 // Heap fragmentation guard: restart if memory gets critically low (settings live in NVS, so nothing is lost)
 void checkHeap() {
   if (ESP.getFreeHeap() < HEAP_MIN_FREE || ESP.getMaxAllocHeap() < HEAP_MIN_BLOCK) {
     Serial.printf("Low heap (free %u, block %u) - restarting\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-    saveMinMax();
+    persistAll();
     delay(200);
     ESP.restart();
   }
@@ -874,6 +1091,7 @@ void loop() {
   static bool histSeeded = false;
   uint32_t now = millis();
 
+  feedWdt();
   server.handleClient();
   ArduinoOTA.handle();
 
@@ -883,9 +1101,13 @@ void loop() {
   if (oledOk) {
     if (now - tPage >= 3000) {
       tPage = now;
-      pageSeqIdx = (pageSeqIdx + 1) % (sizeof(PAGE_SEQ) / sizeof(PAGE_SEQ[0]));
+      int from = PAGE_SEQ[pageSeqIdx];
+      pageSeqIdx = (pageSeqIdx + 1) % PAGE_SEQ_N;
+      startTransition(from, PAGE_SEQ[pageSeqIdx], (now / 500) % 2);
     }
-    if (now - tRedraw >= 500) {
+    if (trStep >= 0) {
+      if (now - trLastMs >= TR_FRAME_MS) { trLastMs = now; stepTransition(); tRedraw = now; }
+    } else if (now - tRedraw >= 500) {
       tRedraw = now;
       drawPage(PAGE_SEQ[pageSeqIdx], (now / 500) % 2);
     }
@@ -899,5 +1121,5 @@ void loop() {
   if (now - tDaily >= 30000) { tDaily = now; checkDailyReport(); }
   if (now - tTg >= 8000) { tTg = now; pollTelegram(); }
   if (now - tHeap >= 60000) { tHeap = now; checkHeap(); }
-  if (now - tPersist >= 15UL * 60UL * 1000UL) { tPersist = now; saveMinMax(); }
+  if (now - tPersist >= 15UL * 60UL * 1000UL) { tPersist = now; persistAll(); }
 }
