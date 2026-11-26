@@ -52,6 +52,9 @@ label{display:flex;justify-content:space-between;align-items:center;margin:8px 0
 canvas{width:100%;height:260px;display:block}
 #camImg{width:100%;display:block;border-radius:12px;border:1px solid var(--line);margin-bottom:10px;cursor:zoom-in}
 #camImg:not([src]){display:none}
+#camBig{position:fixed;inset:0;background:#000;z-index:20;display:none;overflow:auto;cursor:zoom-out}
+#camBig.show{display:flex}
+#camBig img{margin:auto;max-width:100%;max-height:100%;object-fit:contain}
 .legend{display:flex;gap:16px;font-size:.85rem;color:var(--mut);margin-bottom:6px;flex-wrap:wrap}
 .legend i{display:inline-block;width:12px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}
 #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(100px);background:#1d3b22;border:1px solid var(--green);padding:12px 18px;border-radius:12px;transition:.3s;z-index:9}
@@ -84,7 +87,7 @@ footer{text-align:center;color:var(--mut);font-size:.8rem;margin:22px 0 6px}
 
  <div class="card wide" id="camCard" style="display:none">
   <h2>📷 Tent Camera</h2>
-  <img id="camImg" alt="Tent camera picture" onclick="if(this.src)open(this.src)" onerror="camErr()">
+  <img id="camImg" alt="Tent camera picture" onclick="camZoom(true)" onerror="camErr()">
   <div class="kv"><span>Camera</span><span id="camState">--</span></div>
   <div class="kv"><span>Picture</span><span id="camShot">--</span></div>
   <div class="kv"><span>Telegram photo</span><span id="camTg">--</span></div>
@@ -147,6 +150,7 @@ footer{text-align:center;color:var(--mut);font-size:.8rem;margin:22px 0 6px}
 </div>
 <div id="toast"></div>
 
+<div id="camBig" onclick="camZoom(false)"><img alt="Tent camera picture, full size"></div>
 <script>
 const $=id=>document.getElementById(id);
 let D=null,H=[];
@@ -236,6 +240,8 @@ function camLoad(fresh){
  $('camImg').src=camUrl('/snapshot.jpg?'+(fresh?'fresh=1&':'')+'t='+Date.now());
  if(fresh)toast('📷 Taking a new picture...');
 }
+// full-size view inside the page: reuses the picture already loaded instead of opening a new tab
+function camZoom(on){const b=$('camBig');if(on){if(!$('camImg').src)return;b.firstChild.src=$('camImg').src;}b.classList.toggle('show',on);}
 function camErr(){camFail=true;$('camImg').removeAttribute('src');camNext=Date.now()+30000;}
 function camSend(){if(D&&D.cam&&D.cam.ip)post(camUrl('/api/telegram-photo'));}
 function camOpen(p){if(D&&D.cam&&D.cam.ip)open(camUrl(p));}
