@@ -12,6 +12,7 @@
 #include <ArduinoOTA.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
+#include <esp_adc_cal.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
 #include <ArduinoJson.h>
@@ -82,8 +83,11 @@ int soilPct = -1;
 // ----------------------------------------------------------------------------
 //  Settings (persisted)
 // ----------------------------------------------------------------------------
-int dryRaw = DEFAULT_DRY_RAW;
-int wetRaw = DEFAULT_WET_RAW;
+// Soil calibration in millivolts (analogReadMilliVolts, eFuse-corrected). Older firmware
+// stored raw ADC counts under "dry"/"wet"; those keys are left untouched and converted
+// once to mV ("dryMv"/"wetMv") with the same characterisation analogReadMilliVolts uses.
+int dryRaw = DEFAULT_DRY_RAW;   // mV
+int wetRaw = DEFAULT_WET_RAW;   // mV
 int alertThreshold = DEFAULT_ALERT_THRESHOLD;
 int reportHour = DEFAULT_REPORT_HOUR;   // -1 = daily report off
 time_t lastWatered = 0;
@@ -204,6 +208,23 @@ int rawToPct(float raw) {
   return constrain((int)lroundf(p), 0, 100);
 }
 
+// Like rawToPct, but the shown % only moves once the value is clearly past the
+// rounding edge, so it does not flicker between two neighbouring numbers.
+int rawToPctSteady(float raw, int prev) {
+  int p = rawToPct(raw);
+  if (p < 0 || prev < 0 || abs(p - prev) >= 2) return p;
+  float span = (float)dryRaw - (float)wetRaw;
+  float exact = ((float)dryRaw - raw) * 100.0f / span;
+  return fabsf(exact - prev) > 0.8f ? p : prev;
+}
+
+// ADC counts (12 bit, 11 dB) -> mV, same eFuse characterisation as analogReadMilliVolts
+int countsToMv(int counts) {
+  esp_adc_cal_characteristics_t chars;
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &chars);
+  return (int)esp_adc_cal_raw_to_voltage(constrain(counts, 0, 4095), &chars);
+}
+
 float svp(float t) { return 0.6108f * expf(17.27f * t / (t + 237.3f)); }
 
 // Leaf VPD in kPa
@@ -239,8 +260,8 @@ const char *vpdStage(float v) {
 // ----------------------------------------------------------------------------
 void loadSettings() {
   prefs.begin("guardian", true);
-  dryRaw = prefs.getInt("dry", DEFAULT_DRY_RAW);
-  wetRaw = prefs.getInt("wet", DEFAULT_WET_RAW);
+  dryRaw = prefs.isKey("dryMv") ? prefs.getInt("dryMv") : countsToMv(prefs.getInt("dry", DEFAULT_DRY_RAW));
+  wetRaw = prefs.isKey("wetMv") ? prefs.getInt("wetMv") : countsToMv(prefs.getInt("wet", DEFAULT_WET_RAW));
   alertThreshold = prefs.getInt("thresh", DEFAULT_ALERT_THRESHOLD);
   reportHour = prefs.getInt("repHour", DEFAULT_REPORT_HOUR);
   lastWatered = prefs.getULong("watered", 0);
@@ -256,8 +277,8 @@ void loadSettings() {
 
 void saveSettings() {
   prefs.begin("guardian", false);
-  prefs.putInt("dry", dryRaw);
-  prefs.putInt("wet", wetRaw);
+  prefs.putInt("dryMv", dryRaw);
+  prefs.putInt("wetMv", wetRaw);
   prefs.putInt("thresh", alertThreshold);
   prefs.putInt("repHour", reportHour);
   prefs.putULong("watered", lastWatered);
@@ -400,15 +421,23 @@ void pollTelegram() {
 // ----------------------------------------------------------------------------
 //  Sensors
 // ----------------------------------------------------------------------------
-// 16 ADC reads, sorted; the 4 lowest and 4 highest are dropped (ESP32 ADC noise spikes)
+// 32 reads in mV spread over ~6 ms, sorted; the 8 lowest and 8 highest are dropped and the
+// middle half is averaged (robust against ADC noise and WiFi TX ripple on the supply).
+// GPIO34 is on ADC1, so WiFi does not block or corrupt the reading (that only hits ADC2).
 int readSoilRaw() {
-  int v[16];
-  for (int i = 0; i < 16; i++) { v[i] = analogRead(PIN_SOIL); delayMicroseconds(200); }
-  std::sort(v, v + 16);
+  constexpr int N = 32, CUT = 8;
+  int v[N];
+  for (int i = 0; i < N; i++) { v[i] = analogReadMilliVolts(PIN_SOIL); delayMicroseconds(200); }
+  std::sort(v, v + N);
   int sum = 0;
-  for (int i = 4; i < 12; i++) sum += v[i];
-  return sum / 8;
+  for (int i = CUT; i < N - CUT; i++) sum += v[i];
+  return sum / (N - 2 * CUT);
 }
+
+// Exponential moving average for the shown soil value (~20 s time constant at 1 sample/s).
+// Soil moisture changes slowly, so this only removes jitter; watering still shows within a minute.
+constexpr float SOIL_EMA_ALPHA = 0.05f;
+float soilEma = NAN;
 
 // Outlier filter: a sample that jumps further than maxJump from the last accepted one is
 // dropped, unless the new level holds for SPIKE_CONFIRM samples in a row (real change,
@@ -457,13 +486,16 @@ void sampleSensors() {
   }
 
   int raw = readSoilRaw();
-  if (rawFilter.accept(raw, 400)) rawRing.push(raw);
+  if (rawFilter.accept(raw, 300)) {   // mV per second
+    rawRing.push(raw);
+    soilEma = isnan(soilEma) ? raw : soilEma + SOIL_EMA_ALPHA * (raw - soilEma);
+  }
   if (samples < AVG_N) samples++;
 
   avgTemp = tempRing.avg();
   avgHum = humRing.avg();
-  avgRaw = rawRing.avg();
-  soilPct = rawToPct(avgRaw);
+  avgRaw = soilEma;
+  soilPct = rawToPctSteady(avgRaw, soilPct);
 
   // only track min/max once the 10 s window is full
   if (samples >= AVG_N) {
@@ -887,21 +919,24 @@ void sendResult(bool ok, const String &msg) {
 
 void handleCalibrate() {
   String type = server.arg("type");
-  if (samples < AVG_N || isnan(avgRaw)) return sendResult(false, "Sensor still warming up, try again in a few seconds.");
-  int raw = lroundf(avgRaw);
+  // calibrate on the 10 s mean (the EMA may still be catching up right after watering)
+  float ring = rawRing.avg();
+  if (samples < AVG_N || isnan(ring)) return sendResult(false, "Sensor still warming up, try again in a few seconds.");
+  int raw = lroundf(ring);
+  soilEma = avgRaw = ring;
   if (type == "wet") {
-    if (abs(raw - dryRaw) < 200) return sendResult(false, "Reading is too close to the dry value - is the sensor in wet soil?");
+    if (abs(raw - dryRaw) < 150) return sendResult(false, "Reading is too close to the dry value - is the sensor in wet soil?");
     wetRaw = raw;
     saveSettings();
     soilPct = rawToPct(avgRaw);
     markWatered(false);
-    sendResult(true, "Calibrated: 100% = " + String(raw));
+    sendResult(true, "Calibrated: 100% = " + String(raw) + " mV");
   } else if (type == "dry") {
-    if (abs(raw - wetRaw) < 200) return sendResult(false, "Reading is too close to the wet value - is the sensor dry?");
+    if (abs(raw - wetRaw) < 150) return sendResult(false, "Reading is too close to the wet value - is the sensor dry?");
     dryRaw = raw;
     saveSettings();
     soilPct = rawToPct(avgRaw);
-    sendResult(true, "Calibrated: 0% = " + String(raw));
+    sendResult(true, "Calibrated: 0% = " + String(raw) + " mV");
   } else {
     sendResult(false, "Unknown calibration type");
   }
